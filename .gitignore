@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Uploads and temporary files
+uploads/
+prediction_heatmap.jpg
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# VS Code / IDEs
+.vscode/
+.idea/
+
+# Note: data/ and models/ are NOT ignored because they are small enough to upload.
+# If they get too large (> 100MB per file), uncomment the lines below:
+# data/
+# models/
