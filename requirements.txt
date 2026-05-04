@@ -5,3 +5,5 @@ pillow
 matplotlib
 grad-cam
 opencv-python-headless
+scikit-learn
+joblib

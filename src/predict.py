@@ -2,6 +2,7 @@ import argparse
 import math
 from pathlib import Path
 from typing import List, Tuple
+import joblib
 
 import cv2
 import numpy as np
@@ -37,9 +38,8 @@ def estimate_severity(image_path: Path) -> Tuple[str, float]:
 
     return level, delta
 
-def calculate_normalized_entropy(probs: torch.Tensor) -> float:
-    """Calculate the normalized predictive entropy of a probability distribution."""
-    probs = probs.cpu().numpy()[0]
+def calculate_normalized_entropy(probs: np.ndarray) -> float:
+    """Calculate the normalized predictive entropy of a probability distribution (numpy)."""
     num_classes = len(probs)
     if num_classes <= 1:
         return 0.0
@@ -82,38 +82,71 @@ def predict_image(
 ) -> Tuple[str, float, float, str, float]:
     
     architectures = ["resnet18", "efficientnet_b0", "densenet121"]
-    models_ensemble = []
+    backbones = []
+    svms = []
     class_names = []
+
+    # Prepare input tensor
+    tensor = preprocess_for_model(image_path, device=device)
 
     for arch in architectures:
         model_path = models_dir / f"{arch}_model.pth"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model not found: {model_path}")
+        svm_path = models_dir / f"{arch}_svm.joblib"
+        
+        if not model_path.exists() or not svm_path.exists():
+            raise FileNotFoundError(f"Components for {arch} not found in {models_dir}")
             
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         if not class_names:
             class_names = checkpoint["class_names"]
             
-        model = create_model(arch=arch, num_classes=len(class_names), freeze_backbone=False).to(device)
+        # Load the PyTorch model for feature extraction
+        model = create_model(arch=arch, num_classes=len(class_names), freeze_backbone=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
-        models_ensemble.append((arch, model))
-
-    tensor = preprocess_for_model(image_path, device=device)
-
-    ensemble_probs = []
-    for arch, model in models_ensemble:
+        model.to(device)
+        
+        # 1. Prediction using SVM
+        svm_clf = joblib.load(svm_path)
+        
+        # Clone model to modify it for feature extraction without affecting Grad-CAM (which needs the head)
+        feat_extractor = create_model(arch=arch, num_classes=len(class_names), freeze_backbone=False)
+        feat_extractor.load_state_dict(checkpoint["model_state_dict"])
+        if arch == "resnet18":
+            feat_extractor.fc = nn.Identity()
+        elif arch == "efficientnet_b0":
+            feat_extractor.classifier[1] = nn.Identity()
+        elif arch == "densenet121":
+            feat_extractor.classifier = nn.Identity()
+        
+        feat_extractor.to(device)
+        feat_extractor.eval()
+        
         with torch.no_grad():
-            logits = model(tensor)
-            probs = torch.softmax(logits, dim=1)
-            ensemble_probs.append(probs)
+            features = feat_extractor(tensor).cpu().numpy()
+            probs = svm_clf.predict_proba(features) # [1, num_classes]
+            svms.append(probs[0])
             
-    # Soft voting: average the probabilities
-    avg_probs = torch.mean(torch.stack(ensemble_probs), dim=0)
-    conf, idx = torch.max(avg_probs, dim=1)
+        backbones.append((arch, model))
+
+    # Weighted ensembling weights
+    # EfficientNet-B0 is significantly stronger, so we give it 70% weight
+    weights = {
+        "efficientnet_b0": 0.70,
+        "densenet121": 0.15,
+        "resnet18": 0.15
+    }
     
-    pred_class = class_names[idx.item()]
-    confidence = conf.item()
+    # Calculate weighted average of probabilities
+    weighted_probs = []
+    for arch, probs in zip(architectures, svms):
+        weighted_probs.append(probs * weights[arch])
+        
+    avg_probs = np.sum(weighted_probs, axis=0)
+    idx = np.argmax(avg_probs)
+    confidence = avg_probs[idx]
+    
+    pred_class = class_names[idx]
     
     # Uncertainty quantification
     entropy = calculate_normalized_entropy(avg_probs)
@@ -121,17 +154,18 @@ def predict_image(
     # Severity calculation
     severity_level, delta_value = estimate_severity(image_path)
     
-    # Generate Grad-CAM using the first model in ensemble (ResNet18 usually)
-    first_arch, first_model = models_ensemble[0]
+    # Generate Grad-CAM using the first model (ResNet18 usually)
+    # We use the original model with head for Grad-CAM gradients
+    first_arch, first_model = backbones[0]
     heatmap_path = Path("prediction_heatmap.jpg")
-    generate_gradcam(first_model, first_arch, tensor, image_path, idx.item(), heatmap_path)
+    generate_gradcam(first_model, first_arch, tensor, image_path, int(idx), heatmap_path)
 
-    return pred_class, confidence, entropy, severity_level, delta_value
+    return pred_class, float(confidence), entropy, severity_level, delta_value
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Predict solar panel fault from a thermal image using an ensemble."
+        description="Predict solar panel fault from a thermal image using a CNN+SVM ensemble."
     )
     parser.add_argument("--image-path", type=str, required=True, help="Path to input image")
     parser.add_argument(
@@ -152,6 +186,7 @@ def main() -> None:
     models_dir = Path(args.models_dir)
 
     if args.show_image_info:
+        from preprocess import get_image_info
         info = get_image_info(image_path)
         print("\n-- Raw image diagnostics ------------------------------")
         for k, v in info.items():
@@ -163,7 +198,7 @@ def main() -> None:
     )
 
     print(f"Predicted Class : {pred_class}")
-    print(f"Confidence      : {confidence:.4f} (Soft Voting)")
+    print(f"Confidence      : {confidence:.4f} (SVM Ensemble Soft Voting)")
     print(f"Norm. Entropy   : {entropy:.4f} (0 = Certain, 1 = Uncertain)")
     print(f"Severity Level  : {severity_level}")
     print(f"Thermal Delta   : {delta_value:.2f} (99th percentile - median)")
